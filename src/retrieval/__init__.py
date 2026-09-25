@@ -16,11 +16,29 @@ from .data_loader import (
     get_record,
     load_records,
 )
+from .retriever import (
+    CONCEPTS,
+    EvidenceItem,
+    FORBIDDEN_LABEL_FIELDS,
+    RetrievalError,
+    SPECIALTIES,
+    format_results,
+    retrieve_evidence,
+)
 
 __all__ = [
+    # Day 1 — data loading
     "ClinicalRecord",
     "CLINICAL_FIELDS",
     "DataValidationError",
     "get_record",
     "load_records",
+    # Day 2 — transparent retrieval baseline
+    "CONCEPTS",
+    "EvidenceItem",
+    "FORBIDDEN_LABEL_FIELDS",
+    "RetrievalError",
+    "SPECIALTIES",
+    "format_results",
+    "retrieve_evidence",
 ]
