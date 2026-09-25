@@ -223,6 +223,10 @@ class EvidenceItem:
     matched_terms: List[str] = dataclass_field(default_factory=list)
     score: float = 0.0
     reason: str = ""
+    # How the concept was activated: "direct" (a concept term was literally in
+    # the question) or "umbrella" (a specialty umbrella term activated the whole
+    # panel without the question naming this concept).
+    activation: str = "direct"
 
 
 def _normalize(text: str) -> str:
@@ -329,6 +333,34 @@ def _excerpt(sentence: str, max_len: int = 240) -> str:
     return sentence if len(sentence) <= max_len else sentence[: max_len - 1].rstrip() + "…"
 
 
+def _panel_reason(
+    umbrella_only: bool,
+    specialty_display: str,
+    umbrella_terms_found: List[str],
+    concept_name: str,
+    *,
+    tail: str,
+    direct_tail: str,
+) -> str:
+    """Build a reason that distinguishes umbrella activation from direct match.
+
+    - Umbrella activation: the field is part of a specialty panel activated by an
+      umbrella term (e.g. "cardiovascular"); the question did not name this
+      concept literally.
+    - Direct match: the question literally contained a term for this concept.
+    """
+    if umbrella_only:
+        return (
+            f"Retrieved because the {specialty_display} specialty/query activated the "
+            f"{specialty_display} evidence panel via the term(s) {umbrella_terms_found}"
+            f"{tail}"
+        )
+    return (
+        f"Retrieved because the question directly matched the '{concept_name}' concept"
+        f"{direct_tail}"
+    )
+
+
 def retrieve_evidence(
     study_id: int,
     specialty: str,
@@ -362,6 +394,10 @@ def retrieve_evidence(
     umbrella_hits = _matched_query_terms(spec["umbrella_terms"], normalized_question)
     umbrella_terms_found = [t for t, _ in umbrella_hits]
     umbrella_active = bool(umbrella_hits)
+    # Label used to describe the activated panel in umbrella reasons. Prefer the
+    # umbrella term the question actually used (e.g. "cardiovascular"); fall back
+    # to the specialty name.
+    specialty_display = umbrella_terms_found[0] if umbrella_terms_found else specialty_key
 
     record: ClinicalRecord = get_record(study_id)
     sentences = _split_sentences(record.raw_report)
@@ -380,6 +416,7 @@ def retrieve_evidence(
             continue
 
         umbrella_only = not triggered_by_specific
+        activation = "umbrella" if umbrella_only else "direct"
         if triggered_by_specific:
             matched_terms = [t for t, _ in specific_hits]
         else:
@@ -395,6 +432,18 @@ def retrieve_evidence(
                     ("image_path", record.image_path),
                 ):
                     score = _score_from_terms(specific_hits, umbrella_only)
+                    reason = _panel_reason(
+                        umbrella_only, specialty_display, umbrella_terms_found,
+                        concept_name,
+                        tail=(
+                            f"; returning image metadata '{meta_field}' "
+                            f"(metadata only, the image was not analyzed)."
+                        ),
+                        direct_tail=(
+                            f", so image metadata '{meta_field}' is returned "
+                            f"(metadata only, the image was not analyzed)."
+                        ),
+                    )
                     items.append(
                         EvidenceItem(
                             source="image_metadata",
@@ -402,17 +451,26 @@ def retrieve_evidence(
                             value=meta_value,
                             matched_terms=matched_terms,
                             score=score,
-                            reason=(
-                                f"Retrieved because the question matched the "
-                                f"'{concept_name}' concept; returning image metadata "
-                                f"'{meta_field}' (metadata only, the image was not analyzed)."
-                            ),
+                            reason=reason,
+                            activation=activation,
                         )
                     )
                 continue
 
             value = record.clinical_evidence[field_name]
             score = _score_structured_field(field_name, value, specific_hits, umbrella_only)
+            reason = _panel_reason(
+                umbrella_only, specialty_display, umbrella_terms_found, concept_name,
+                tail=(
+                    f"; the '{field_name}' field is part of that panel (not a literal "
+                    f"match to '{concept_name}'). The value is reported as-is and is "
+                    f"not interpreted as a diagnosis."
+                ),
+                direct_tail=(
+                    f", which maps to the '{field_name}' field. The value is reported "
+                    f"as-is and is not interpreted as a diagnosis."
+                ),
+            )
             items.append(
                 EvidenceItem(
                     source="clinical",
@@ -420,17 +478,29 @@ def retrieve_evidence(
                     value=value,
                     matched_terms=matched_terms,
                     score=score,
-                    reason=(
-                        f"Retrieved because the question matched the '{concept_name}' "
-                        f"concept, which maps to the '{field_name}' field. The value is "
-                        f"reported as-is and is not interpreted as a diagnosis."
-                    ),
+                    reason=reason,
+                    activation=activation,
                 )
             )
 
         # --- Radiology report evidence ----------------------------------------
         report_hits = _search_report(concept["report_terms"], sentences)
         for excerpt, report_matched, report_score in report_hits:
+            if umbrella_only:
+                reason = (
+                    f"Retrieved because the {specialty_display} specialty/query "
+                    f"activated the {specialty_display} evidence panel via the term(s) "
+                    f"{umbrella_terms_found}; the '{concept_name}' concept (part of that "
+                    f"panel) matched the report term(s) {report_matched} in this "
+                    f"sentence. Quoted verbatim from the real report; not a diagnosis."
+                )
+            else:
+                reason = (
+                    f"Retrieved because the question directly matched the "
+                    f"'{concept_name}' concept, whose report term(s) {report_matched} "
+                    f"appear in this sentence. Quoted verbatim from the real report; "
+                    f"not a diagnosis."
+                )
             items.append(
                 EvidenceItem(
                     source="radiology",
@@ -438,11 +508,8 @@ def retrieve_evidence(
                     value=_excerpt(excerpt),
                     matched_terms=sorted(set(matched_terms) | set(report_matched)),
                     score=report_score,
-                    reason=(
-                        f"Retrieved because the '{concept_name}' concept matched the "
-                        f"report term(s) {report_matched} in this sentence. The excerpt "
-                        f"is quoted verbatim from the real report; it is not a diagnosis."
-                    ),
+                    reason=reason,
+                    activation=activation,
                 )
             )
 
@@ -476,13 +543,22 @@ def _merge_duplicate_report_items(items: List[EvidenceItem]) -> List[EvidenceIte
         if existing is None:
             merged[key] = it
         else:
+            # A direct match is a stronger explanation than umbrella activation,
+            # so prefer the direct item's reason/activation when merging.
+            if existing.activation == "direct":
+                keep_reason, keep_activation = existing.reason, existing.activation
+            elif it.activation == "direct":
+                keep_reason, keep_activation = it.reason, it.activation
+            else:
+                keep_reason, keep_activation = existing.reason, existing.activation
             merged[key] = EvidenceItem(
                 source=it.source,
                 field=it.field,
                 value=it.value,
                 matched_terms=sorted(set(existing.matched_terms) | set(it.matched_terms)),
                 score=max(existing.score, it.score),
-                reason=existing.reason,
+                reason=keep_reason,
+                activation=keep_activation,
             )
     return passthrough + list(merged.values())
 
@@ -519,6 +595,7 @@ def format_results(items: List[EvidenceItem]) -> str:
             f"   Field: {it.field}\n"
             f"   {label}: {value!r}\n"
             f"   Score: {it.score}\n"
+            f"   Activation: {it.activation}\n"
             f"   Matched terms: {it.matched_terms}\n"
             f"   Reason: {it.reason}"
         )
@@ -622,19 +699,19 @@ def _demo() -> None:
         print()
 
     run(
-        "TEST 1 — Cardiology",
+        "TEST 1 — Cardiology broad (umbrella activation)",
         50543252, "Cardiology",
         "What cardiovascular information is available for this patient?",
     )
     run(
-        "TEST 2 — Pulmonology",
-        50543252, "Pulmonology",
-        "What respiratory information is available?",
+        "TEST 2 — Cardiology direct (concept match)",
+        50543252, "Cardiology",
+        "What information about heart failure is available?",
     )
     run(
-        "TEST 3 — Different real study (Cardiology)",
-        52858944, "Cardiology",
-        "Any heart failure or heart rate information for this patient?",
+        "TEST 3 — Pulmonology broad (umbrella activation)",
+        50543252, "Pulmonology",
+        "What respiratory information is available?",
     )
     run(
         "TEST 4 — Unrelated kidney question (should be empty)",
