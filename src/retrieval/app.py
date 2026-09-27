@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .data_loader import IMAGE_ROOT, get_record, load_records
 from .retriever import EvidenceItem, retrieve_evidence
+from .summarizer import generate_summary
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("RETRIEVAL_UI_PORT", "8000"))
@@ -101,6 +102,20 @@ def _retrieve_payload(study_id: int, specialty: str, question: str, top_k: int) 
     }
 
 
+def _summarize_payload(study_id: int, specialty: str, question: str, top_k: int) -> dict:
+    """Re-run retrieval server-side, then summarize ONLY those evidence items.
+
+    Retrieval is deterministic, so re-running with the same inputs yields the
+    same items the UI already displays. Only these items are passed to the
+    summarizer — the full dataset and labels are never sent.
+    """
+    items = retrieve_evidence(study_id, specialty, question, top_k=top_k)
+    result = generate_summary(items, specialty, question)
+    # Keep the response lean; the client already has the evidence items for
+    # citation expansion. evidence_context is included for transparency/audit.
+    return result
+
+
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -156,6 +171,19 @@ INDEX_HTML = """<!DOCTYPE html>
   .disclaimer { font-size:12px; color:#92400e; background:#fffbeb; border:1px solid #fde68a;
                 padding:8px 10px; border-radius:8px; margin-top:10px; }
   .hidden { display:none; }
+  .summary { font-size:14.5px; line-height:1.6; margin:12px 0 4px; }
+  .summary .cite { color:var(--accent); font-weight:600; cursor:pointer; text-decoration:none;
+                   background:var(--chip); border:1px solid var(--chipbd); border-radius:5px;
+                   padding:0 4px; white-space:nowrap; }
+  .summary .cite:hover { background:#dbeafe; }
+  #summarySources { margin-top:10px; font-size:13px; }
+  #summarySources .lbl { color:var(--muted); margin-right:6px; }
+  #summarySources .chip { cursor:pointer; }
+  #summaryStatus { font-size:13px; color:var(--muted); }
+  .status-unavailable { color:#92400e; background:#fffbeb; border:1px solid #fde68a;
+                        padding:8px 10px; border-radius:8px; }
+  .ev.flash { animation: flash 1.4s ease-out; }
+  @keyframes flash { 0%{ background:#fef08a; } 100%{ background:#fff; } }
 </style>
 </head>
 <body>
@@ -199,6 +227,18 @@ INDEX_HTML = """<!DOCTYPE html>
         </figure>
       </section>
     </div>
+
+    <section class="panel" id="summaryPanel">
+      <h2>AI Summary of Retrieved Evidence</h2>
+      <button type="button" id="genSummary">Generate AI Summary</button>
+      <div id="summaryOut" class="hidden">
+        <div id="summaryStatus"></div>
+        <div id="summaryText" class="summary"></div>
+        <div id="summarySources"></div>
+        <div class="disclaimer" id="summaryDisclaimer">AI-generated summary of the
+          retrieved evidence. It does not provide a diagnosis or medical advice.</div>
+      </div>
+    </section>
   </div>
 </div>
 
@@ -232,7 +272,7 @@ function renderEvidence(items){
     const body = it.source === 'radiology'
       ? `<div class="excerpt">${esc(it.value)}</div>`
       : `<div class="val">${esc(it.value)}</div>`;
-    return `<div class="ev">
+    return `<div class="ev" id="ev-${i}" data-field="${esc(it.field)}" data-source="${esc(it.source)}">
       <div class="top">
         <span class="name">${i+1}. ${esc(it.label)}</span>
         <span class="src ${esc(it.source)}">${esc(it.source)}</span>
@@ -248,6 +288,94 @@ function renderEvidence(items){
   }).join('');
 }
 
+let lastQuery = null;
+let lastCount = 0;
+
+function resetSummary(){
+  document.getElementById('summaryOut').classList.add('hidden');
+  document.getElementById('summaryText').innerHTML = '';
+  document.getElementById('summarySources').innerHTML = '';
+  document.getElementById('summaryStatus').innerHTML = '';
+  const btn = document.getElementById('genSummary');
+  btn.disabled = false;
+  btn.textContent = 'Generate AI Summary';
+}
+
+function findCard(ref){
+  if(ref === 'radiology_report') return document.querySelector('.ev[data-source="radiology"]');
+  return document.querySelector(`.ev[data-field="${CSS.escape(ref)}"]`);
+}
+function focusCard(ref){
+  const card = findCard(ref);
+  if(!card) return;
+  card.scrollIntoView({behavior:'smooth', block:'center'});
+  card.classList.remove('flash'); void card.offsetWidth; card.classList.add('flash');
+}
+
+function linkifyCitations(text){
+  // Turn [token] into clickable citation spans mapped to evidence cards.
+  return esc(text).replace(/\\[([a-zA-Z0-9_]+)\\]/g, (m, ref) =>
+    `<span class="cite" data-ref="${esc(ref)}">[${esc(ref)}]</span>`);
+}
+
+function renderSources(sources){
+  const box = document.getElementById('summarySources');
+  if(!sources || !sources.length){ box.innerHTML=''; return; }
+  box.innerHTML = '<span class="lbl">Sources:</span>' +
+    sources.map(s => `<span class="chip" data-ref="${esc(s)}">${esc(s)}</span>`).join(' ');
+}
+
+document.getElementById('genSummary').addEventListener('click', async () => {
+  if(!lastQuery) return;
+  const btn = document.getElementById('genSummary');
+  const out = document.getElementById('summaryOut');
+  const statusEl = document.getElementById('summaryStatus');
+  const textEl = document.getElementById('summaryText');
+  const disc = document.getElementById('summaryDisclaimer');
+  out.classList.remove('hidden');
+  textEl.innerHTML = '';
+  document.getElementById('summarySources').innerHTML = '';
+  disc.classList.add('hidden');
+
+  if(lastCount === 0){
+    statusEl.className = '';
+    statusEl.textContent = 'No relevant evidence was retrieved for this question, so an AI summary was not generated.';
+    return;
+  }
+
+  btn.disabled = true; btn.textContent = 'Generating…';
+  statusEl.className = ''; statusEl.textContent = 'Generating summary from retrieved evidence…';
+  const {study_id, specialty, question} = lastQuery;
+  const url = `/api/summarize?study_id=${encodeURIComponent(study_id)}` +
+              `&specialty=${encodeURIComponent(specialty)}` +
+              `&question=${encodeURIComponent(question)}`;
+  try {
+    const data = await (await fetch(url)).json();
+    if(data.status === 'ok'){
+      statusEl.className = ''; statusEl.textContent = data.model ? `Model: ${data.model}` : '';
+      textEl.innerHTML = linkifyCitations(data.summary || '');
+      renderSources(data.sources);
+      disc.classList.remove('hidden');
+    } else {
+      // unavailable / empty / error — show the message, no fabricated summary.
+      statusEl.className = 'status-unavailable';
+      statusEl.textContent = data.message || 'AI summary unavailable.';
+      renderSources(data.sources);
+    }
+  } catch (err) {
+    statusEl.className = 'status-unavailable';
+    statusEl.textContent = 'AI summary unavailable: request failed.';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Generate AI Summary';
+  }
+});
+
+// Delegated clicks for inline citations and source chips.
+document.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-ref]');
+  if(el){ focusCard(el.getAttribute('data-ref')); }
+});
+
 document.getElementById('form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const specialty = document.getElementById('specialty').value;
@@ -260,6 +388,9 @@ document.getElementById('form').addEventListener('submit', async (e) => {
   document.getElementById('results').classList.remove('hidden');
   renderContext(data.context);
   renderEvidence(data.evidence);
+  lastQuery = {study_id, specialty, question};
+  lastCount = data.count;
+  resetSummary();
   const img = document.getElementById('cxr');
   img.src = data.image_url;
   document.getElementById('cxrcap').textContent =
@@ -310,6 +441,14 @@ class _Handler(BaseHTTPRequestHandler):
                 question = query.get("question", [""])[0]
                 top_k = int(query.get("top_k", ["10"])[0])
                 self._send_json(_retrieve_payload(study_id, specialty, question, top_k))
+                return
+
+            if path == "/api/summarize":
+                study_id = int(query.get("study_id", ["0"])[0])
+                specialty = query.get("specialty", ["General"])[0]
+                question = query.get("question", [""])[0]
+                top_k = int(query.get("top_k", ["10"])[0])
+                self._send_json(_summarize_payload(study_id, specialty, question, top_k))
                 return
 
             if path == "/image":

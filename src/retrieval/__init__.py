@@ -25,6 +25,12 @@ from .retriever import (
     format_results,
     retrieve_evidence,
 )
+from .summarizer import (
+    SYSTEM_PROMPT,
+    build_evidence_context,
+    derive_sources,
+    generate_summary,
+)
 
 __all__ = [
     # Day 1 — data loading
@@ -41,4 +47,9 @@ __all__ = [
     "SPECIALTIES",
     "format_results",
     "retrieve_evidence",
+    # Day 3 — evidence-grounded summarization
+    "SYSTEM_PROMPT",
+    "build_evidence_context",
+    "derive_sources",
+    "generate_summary",
 ]
