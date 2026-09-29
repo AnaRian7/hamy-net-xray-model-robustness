@@ -649,7 +649,7 @@ def run_validation() -> None:
 
     # 7. Label-leakage spy: wrap the scorer and record every field it sees, then
     #    run a broad sweep and assert no forbidden label field ever appears.
-    import src.retrieval.retriever as this_module
+    import demo_draft.retriever as this_module
 
     seen_fields: List[str] = []
     original = this_module._score_structured_field

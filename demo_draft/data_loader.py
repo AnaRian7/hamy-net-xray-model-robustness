@@ -26,9 +26,9 @@ from typing import Any, Dict, List
 import pandas as pd
 
 # --- Paths (resolved relative to the repository root, not the caller's CWD) ---
-# This file lives at <repo>/src/retrieval/data_loader.py, so the repo root is
-# three levels up.
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+# This file lives at <repo>/demo_draft/data_loader.py, so the repo root is
+# two levels up.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 COHORT_CSV = _REPO_ROOT / "data" / "mimic_ed_cxr_pneumonia_multimodal_cohort.csv"
 REPORTS_CSV = _REPO_ROOT / "results" / "mimic_cxr_reports_cohort.csv"
