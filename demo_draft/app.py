@@ -8,7 +8,7 @@ from disk.
 
 Run it with::
 
-    python3 -m src.retrieval.app        # serves http://127.0.0.1:8000
+    python3 -m demo_draft.app        # serves http://127.0.0.1:8000
 
 Routes
 ------
